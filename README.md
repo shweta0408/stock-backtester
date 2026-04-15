@@ -6,7 +6,7 @@ A powerful and easy-to-use stock backtesting tool built with **Streamlit** that 
 
 ## 🚀 Live Demo
 
-👉 Try it here: https://your-app-link.streamlit.app
+👉 Try it here: https://stock-backtester-nwvqmsnrbdp9puur7x9zng.streamlit.app/
 
 ⏳ Note: App may take ~15–20 seconds to wake up if idle.
 
