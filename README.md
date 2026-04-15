@@ -4,6 +4,12 @@ A powerful and easy-to-use stock backtesting tool built with **Streamlit** that 
 
 ---
 
+## 🚀 Live Demo
+
+👉 Try it here: https://your-app-link.streamlit.app
+
+⏳ Note: App may take ~15–20 seconds to wake up if idle.
+
 ## 🚀 Features
 
 * 📂 Upload Excel/CSV screener files
