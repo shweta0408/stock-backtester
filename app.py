@@ -1,3 +1,5 @@
+
+
 """
 Stock Backtesting Dashboard  —  Streamlit UI
 =============================================
@@ -18,6 +20,36 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
 )
+
+uploaded = st.file_uploader("Upload screener file", type=["xlsx", "csv"])
+if uploaded and st.button("Run Backtest"):
+    with st.spinner("Running backtest …"):
+        progress_bar = st.progress(0)
+
+        def on_progress(done, total):
+            progress_bar.progress(done / total)
+        df = run_backtest(uploaded.name, "final_output.xlsx",
+                          progress_callback=on_progress)
+    st.success("Done!")
+    st.dataframe(df)
+    with open("final_output.xlsx", "rb") as f:
+        st.download_button("Download Excel", f, "backtest_results.xlsx")
+
+#  import streamlit as st
+#  from backtest import run_backtest
+#
+#  uploaded = st.file_uploader("Upload screener file", type=["xlsx","csv"])
+#  if uploaded and st.button("Run Backtest"):
+#      with st.spinner("Running backtest …"):
+#          progress_bar = st.progress(0)
+#          def on_progress(done, total):
+#              progress_bar.progress(done / total)
+#          df = run_backtest(uploaded.name, "final_output.xlsx",
+#                            progress_callback=on_progress)
+#      st.success("Done!")
+#      st.dataframe(df)
+#      with open("final_output.xlsx", "rb") as f:
+#          st.download_button("Download Excel", f, "backtest_results.xlsx")
 
 # ─── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -128,18 +160,18 @@ if uploaded_file is not None:
             valid = df_result[df_result["Entry Price"].notna()]
             wins = (valid["Win/Loss"] == "Win").sum()
             win_rate = wins / len(valid) * 100 if len(valid) else 0
-            avg_1w = valid["1W Return %"].mean()
-            avg_2w = valid["2W Return %"].mean()
-            avg_3w = valid["3W Return %"].mean()
+            avg_2d  = valid["2D Return %"].mean()
+            avg_5d  = valid["5D Return %"].mean()
+            avg_10d = valid["10D Return %"].mean()
 
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Total Stocks",    len(df_result))
             m2.metric("Fetched OK",       len(valid))
-            m3.metric("Win Rate (1W)",    f"{win_rate:.1f}%")
-            m4.metric("Avg 1W Return",
-                      f"{avg_1w:+.2f}%" if not pd.isna(avg_1w) else "N/A")
-            m5.metric("Avg 3W Return",
-                      f"{avg_3w:+.2f}%" if not pd.isna(avg_3w) else "N/A")
+            m3.metric("Win Rate (5D)",    f"{win_rate:.1f}%")
+            m4.metric("Avg 2D Return",
+                      f"{avg_2d:+.2f}%" if not pd.isna(avg_2d) else "N/A")
+            m5.metric("Avg 10D Return",
+                      f"{avg_10d:+.2f}%" if not pd.isna(avg_10d) else "N/A")
 
             # ── Signal Breakdown ──────────────────────────────────────────────
             sig_counts = valid["Signal"].value_counts()
@@ -188,7 +220,8 @@ if uploaded_file is not None:
             )
 
             # Format for display
-            for ret_col in ("1W Return %", "2W Return %", "3W Return %"):
+            for ret_col in ("2D Return %", "3D Return %", "4D Return %",
+                            "5D Return %", "6D Return %", "10D Return %"):
                 df_display[ret_col] = df_display[ret_col].apply(
                     lambda x: f"{x:+.2f}%" if pd.notna(x) else "—"
                 )
@@ -231,7 +264,7 @@ else:
         st.markdown("""
 1. **Upload** your screener Excel/CSV file with columns: Symbol, Sector, Market Cap, Date of Entry
 2. **Click Run** — the system fetches historical prices from Yahoo Finance (NSE)
-3. **Results** include: Entry Price, RSI(14), 1W/2W/3W returns, Delivery %, Signal, Win/Loss
+3. **Results** include: Entry Price, RSI(14), 2D/3D/4D/5D/6D/10D returns, Delivery %, Signal, Win/Loss
 4. **Download** the formatted Excel report
 
 **Signal Logic:**
@@ -239,5 +272,5 @@ else:
 - 🔴 **Weak**: RSI below 40
 - 🟡 **Neutral**: everything else
 
-**Win/Loss:** Based on 1-week (5 trading days) forward return.
+**Win/Loss:** Based on 5-day forward return.
         """)
