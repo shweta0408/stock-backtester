@@ -1,12 +1,8 @@
 """
-Stock Backtesting & Analysis System  (OPTIMISED)
-=================================================
-Speed improvements over original:
-  • Batch yfinance download  → all tickers in ONE API call
-  • ThreadPoolExecutor       → parallel per-stock processing
-  • Reduced NSE timeout      → 5 s instead of 12 s, optional
-  • Trimmed sleep/retry delays
-  • Pre-warmed in-memory cache before main loop
+Stock Backtesting & Analysis System
+====================================
+A professional quant analysis tool for evaluating screener signals
+and measuring strategy performance using NSE India stocks.
 
 Usage:
     python backtest.py screener_input.xlsx final_output.xlsx
@@ -20,7 +16,6 @@ import os
 import time
 import logging
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -41,19 +36,13 @@ from openpyxl.utils import get_column_letter
 
 warnings.filterwarnings("ignore")
 
-# ─── Logging Setup ─────────────────────────────────────────────────────────────
+# ─── Logging Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("StockBacktest")
-
-# ── Parallelism config ─────────────────────────────────────────────────────────
-MAX_WORKERS = 10    # concurrent threads for per-stock processing
-BATCH_CHUNK_SIZE = 50    # max tickers per yf.download() batch call
-FETCH_DELIVERY = True  # set False to skip NSE delivery (saves ~1-2 s/stock)
-NSE_TIMEOUT = 5     # seconds per NSE request
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -104,145 +93,114 @@ def load_input_file(filepath: str) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  2. HISTORICAL DATA — batch pre-fetch + in-memory cache
+#  2. HISTORICAL DATA FETCHING  (with in-memory caching)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _DATA_CACHE: dict = {}
 
 
-def _batch_prefetch(symbols: list[str], start: datetime, end: datetime,
-                    exchange: str = "NS"):
-    """
-    Download all tickers in one yf.download() call (much faster than N calls).
-    Populates _DATA_CACHE so per-stock lookups are instant.
-    """
-    if not YF_AVAILABLE or not symbols:
-        return
-
-    tickers = [f"{s}.{exchange}" for s in symbols]
-    fetch_start = (start - timedelta(days=30)).strftime("%Y-%m-%d")
-    fetch_end = (end + timedelta(days=10)).strftime("%Y-%m-%d")
-
-    log.info(f"Batch downloading {len(tickers)} tickers ({exchange}) …")
-    try:
-        raw = yf.download(
-            tickers,
-            start=fetch_start,
-            end=fetch_end,
-            auto_adjust=True,
-            progress=False,
-            timeout=60,
-            group_by="ticker",
-        )
-    except Exception as e:
-        log.warning(f"Batch download failed: {e}")
-        return
-
-    if raw is None or raw.empty:
-        return
-
-    # yf.download with group_by="ticker" returns MultiIndex columns: (ticker, OHLCV)
-    if isinstance(raw.columns, pd.MultiIndex):
-        available_tickers = raw.columns.get_level_values(0).unique()
-        for t in available_tickers:
-            symbol = t.split(".")[0]
-            try:
-                df_t = raw[t].copy()
-                df_t.index = pd.to_datetime(df_t.index).tz_localize(None)
-                df_t = df_t.dropna(how="all").sort_index()
-                if not df_t.empty:
-                    cache_key = f"{t}_{fetch_start}_{fetch_end}"
-                    _DATA_CACHE[cache_key] = df_t
-            except Exception:
-                pass
-    else:
-        # Single ticker — treat as individual
-        if len(tickers) == 1:
-            t = tickers[0]
-            symbol = symbols[0]
-            raw.index = pd.to_datetime(raw.index).tz_localize(None)
-            raw = raw.sort_index()
-            cache_key = f"{t}_{fetch_start}_{fetch_end}"
-            _DATA_CACHE[cache_key] = raw
-
-    log.info(f"Batch cache populated: {len(_DATA_CACHE)} entries")
-
-
 def fetch_data(symbol: str, start: datetime, end: datetime,
                exchange: str = "NS") -> Optional[pd.DataFrame]:
     """
-    Fetch OHLCV — returns from cache if available, else falls back to
-    individual download (also tries .BO if .NS empty).
+    Fetch OHLCV data from Yahoo Finance for NSE stocks.
+
+    - Appends .NS suffix automatically
+    - Falls back to .BO (BSE) if NSE data is unavailable
+    - Caches results to avoid duplicate API calls
+    - Retries up to 3 times on failure with exponential back-off
     """
     if not YF_AVAILABLE:
+        log.error("yfinance is not installed. Cannot fetch data.")
         return None
 
-    fetch_start = (start - timedelta(days=30)).strftime("%Y-%m-%d")
-    fetch_end = (end + timedelta(days=10)).strftime("%Y-%m-%d")
+    # Add buffer: fetch data well before and after to ensure enough history
+    fetch_start = start - timedelta(days=30)
+    fetch_end = end + timedelta(days=10)
 
     for suffix in (exchange, "BO"):
-        ticker = f"{symbol}.{suffix}"
-        cache_key = f"{ticker}_{fetch_start}_{fetch_end}"
+        ticker = f"{symbol}.{suffix}" if not symbol.endswith(
+            f".{suffix}") else symbol
+        cache_key = f"{ticker}_{fetch_start.date()}_{fetch_end.date()}"
 
         if cache_key in _DATA_CACHE:
             cached = _DATA_CACHE[cache_key]
             if cached is not None and not cached.empty:
                 return cached
-            continue   # cached as empty → try next exchange
 
-        # Individual fallback (not pre-cached)
         for attempt in range(3):
             try:
                 raw = yf.download(
                     ticker,
-                    start=fetch_start,
-                    end=fetch_end,
+                    start=fetch_start.strftime("%Y-%m-%d"),
+                    end=fetch_end.strftime("%Y-%m-%d"),
                     auto_adjust=True,
                     progress=False,
                     timeout=25,
                 )
                 if raw is not None and not raw.empty:
+                    # Flatten multi-level columns (yfinance v0.2+)
                     if isinstance(raw.columns, pd.MultiIndex):
                         raw.columns = raw.columns.get_level_values(0)
                     raw.index = pd.to_datetime(raw.index).tz_localize(None)
                     raw = raw.sort_index()
                     _DATA_CACHE[cache_key] = raw
+                    log.debug(
+                        f"[{symbol}] Fetched {len(raw)} rows via {ticker}")
                     return raw
                 else:
                     _DATA_CACHE[cache_key] = None
-                    break
+                    break   # Empty data → try next exchange
+
             except Exception as e:
                 log.warning(
                     f"[{symbol}] Attempt {attempt+1}/3 ({ticker}): {e}")
-                time.sleep(1.0 * (attempt + 1))   # shorter back-off
+                time.sleep(1.5 * (attempt + 1))
 
-    log.error(f"[{symbol}] All fetch attempts failed.")
+    log.error(f"[{symbol}] All data-fetch attempts failed (tried .NS and .BO).")
     return None
 
 
-def get_nearest_trading_day_idx(df: pd.DataFrame,
-                                target_date: datetime) -> Optional[int]:
+def get_nearest_trading_day_idx(df: pd.DataFrame, target_date: datetime) -> Optional[int]:
+    """
+    Return the integer positional index of the nearest previous (or equal) trading day.
+    Returns None if no trading day exists on or before target_date.
+    """
     target = pd.Timestamp(target_date).normalize()
     mask = df.index <= target
     if not mask.any():
         return None
-    return int(np.where(mask)[0][-1])
+    pos = int(np.where(mask)[0][-1])
+    return pos
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  3. RSI
+#  3. RSI CALCULATION  (pure NumPy — no external TA libraries required)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Compute RSI(period) using Wilder's Exponential Moving Average.
+
+    Formula:
+        RS  = AvgGain / AvgLoss   (Wilder's EMA with alpha = 1/period)
+        RSI = 100 - 100 / (1 + RS)
+
+    Returns a Series aligned with the input index.
+    NaN values appear for the first (period) rows.
+    """
     delta = prices.diff()
     gain = delta.clip(lower=0)
     loss = (-delta).clip(lower=0)
+
     alpha = 1.0 / period
+
     avg_gain = gain.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+
+    # Avoid division by zero: when avg_loss == 0, RSI = 100
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi = rsi.where(avg_loss != 0, 100.0)
+    rsi = rsi.where(avg_loss != 0, 100.0)   # RSI = 100 when no losses
     return rsi
 
 
@@ -251,10 +209,25 @@ def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def compute_returns(df: pd.DataFrame, entry_idx: int,
-                    windows: tuple = (5, 10, 15)) -> dict:
+                    windows: tuple = (2, 3, 4, 5, 6, 10)) -> dict:
+    """
+    Calculate % returns after N *trading* days from entry_idx.
+
+    Parameters
+    ----------
+    df        : DataFrame with a 'Close' column (sorted by date ascending)
+    entry_idx : Integer positional index of the entry row
+    windows   : Tuple of trading-day offsets  (2=2D, 3=3D, 4=4D, 5=5D, 6=6D, 10=10D)
+
+    Returns
+    -------
+    dict with keys: entry_price, ret_2d, ret_3d, ret_4d, ret_5d, ret_6d, ret_10d
+    """
     closes = df["Close"]
     entry_price = float(closes.iloc[entry_idx])
+
     result = {"entry_price": round(entry_price, 2)}
+
     for w in windows:
         fwd_idx = entry_idx + w
         if fwd_idx < len(closes):
@@ -262,21 +235,25 @@ def compute_returns(df: pd.DataFrame, entry_idx: int,
             pct = ((fwd_price - entry_price) / entry_price) * 100.0
             result[f"ret_{w}d"] = round(pct, 2)
         else:
-            result[f"ret_{w}d"] = None
+            result[f"ret_{w}d"] = None   # Future data not yet available
+
     return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  5. NSE DELIVERY  (optional, shorter timeout)
+#  5. NSE DELIVERY DATA
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _NSE_SESSION: Optional[requests.Session] = None
 _NSE_HEADERS = {
-    "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"),
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
     "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer":         "https://www.nseindia.com/",
     "Connection":      "keep-alive",
     "DNT":             "1",
@@ -284,63 +261,107 @@ _NSE_HEADERS = {
 
 
 def _get_nse_session() -> requests.Session:
+    """Bootstrap an NSE session: visit homepage first to acquire cookies."""
     global _NSE_SESSION
     if _NSE_SESSION is not None:
         return _NSE_SESSION
+
     session = requests.Session()
     session.headers.update(_NSE_HEADERS)
+
     try:
-        session.get("https://www.nseindia.com", timeout=NSE_TIMEOUT)
+        session.get("https://www.nseindia.com", timeout=10)
+        time.sleep(1.0)
+        # Warm up with market status endpoint (lighter than homepage)
+        session.get("https://www.nseindia.com/api/market-status", timeout=8)
         time.sleep(0.5)
-        session.get("https://www.nseindia.com/api/market-status",
-                    timeout=NSE_TIMEOUT)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"NSE session bootstrap warning: {e}")
+
     _NSE_SESSION = session
     return session
 
 
 def fetch_delivery(symbol: str) -> Optional[float]:
-    if not FETCH_DELIVERY:
-        return None
+    """
+    Fetch latest delivery percentage from NSE India equity endpoint.
+
+    Tries multiple response paths:
+      1. tradeInfo.deliveryQuantity / tradeInfo.totalTradedQuantity
+      2. deliveryToTradedQuantity
+      3. priceInfo.pPriceBand (fallback)
+
+    Returns float 0-100 or None on failure.
+    """
     global _NSE_SESSION
     session = _get_nse_session()
     url = f"https://www.nseindia.com/api/quote-equity?symbol={symbol}"
-    for attempt in range(2):          # only 2 retries instead of 3
+
+    for attempt in range(3):
         try:
-            resp = session.get(url, timeout=NSE_TIMEOUT)
+            resp = session.get(url, timeout=12)
+
             if resp.status_code == 401:
+                log.debug(f"[{symbol}] NSE 401 — refreshing session")
                 _NSE_SESSION = None
                 session = _get_nse_session()
+                time.sleep(2)
                 continue
+
             if resp.status_code != 200:
+                log.debug(f"[{symbol}] NSE HTTP {resp.status_code}")
                 return None
+
             data = resp.json()
+
+            # Path 1: tradeInfo block
             ti = data.get("tradeInfo", {})
-            d_qty = ti.get("deliveryQuantity") or ti.get(
-                "delivQty") or ti.get("deliveryQty")
-            t_qty = (ti.get("totalTradedQuantity") or ti.get("tradedQuantity")
+            d_qty = (ti.get("deliveryQuantity")
+                     or ti.get("delivQty")
+                     or ti.get("deliveryQty"))
+            t_qty = (ti.get("totalTradedQuantity")
+                     or ti.get("tradedQuantity")
                      or ti.get("totalTradedQty"))
+
             if d_qty and t_qty and float(t_qty) > 0:
                 return round(float(d_qty) / float(t_qty) * 100, 2)
+
+            # Path 2: direct field
             dpct = data.get("deliveryToTradedQuantity")
             if dpct is not None:
                 return round(float(dpct), 2)
+
+            log.debug(f"[{symbol}] NSE: delivery fields not found in response")
             return None
+
         except requests.exceptions.ConnectionError:
+            log.debug(
+                f"[{symbol}] NSE connection error — network may be unavailable")
             return None
         except requests.exceptions.Timeout:
-            time.sleep(1.0)
-        except Exception:
+            log.debug(f"[{symbol}] NSE timeout attempt {attempt+1}")
+            time.sleep(2 * (attempt + 1))
+        except (KeyError, ValueError, TypeError) as e:
+            log.debug(f"[{symbol}] NSE parse error: {e}")
             return None
+        except Exception as e:
+            log.debug(f"[{symbol}] NSE unexpected error: {e}")
+            return None
+
     return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  6. SIGNAL + WIN/LOSS
+#  6. SIGNAL + WIN/LOSS CLASSIFICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def classify_signal(rsi: Optional[float]) -> str:
+    """
+    RSI-based signal:
+        Momentum : 55 < RSI < 75
+        Weak     : RSI < 40
+        Neutral  : everything else (including RSI ≥ 75 — overbought)
+    """
     if rsi is None or np.isnan(rsi):
         return "N/A"
     if 55 < rsi < 75:
@@ -357,8 +378,99 @@ def classify_win_loss(ret_1w: Optional[float]) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  7. SINGLE-STOCK PIPELINE
+#  7. MAIN PROCESSING PIPELINE — single stock
 # ═══════════════════════════════════════════════════════════════════════════════
+
+'''def process_stock(row: pd.Series) -> dict:
+    """Full pipeline for a single screener row → enriched metrics dict."""
+    symbol = str(row["Symbol"]).strip().upper()
+    sector = row.get("Sector",     "N/A")
+    mkt_cap = row.get("Market Cap", "N/A")
+    entry_date = pd.to_datetime(row["Date of Entry"])
+
+    base = {
+        "Symbol":      symbol,
+        "Sector":      sector,
+        "Market Cap":  mkt_cap,
+        "Entry Date":  entry_date.date(),
+        "Entry Price": None,
+        "RSI":         None,
+        "1W Return %": None,
+        "2W Return %": None,
+        "3W Return %": None,
+        "Delivery %":  None,
+        "Signal":      "N/A",
+        "Win/Loss":    "N/A",
+    }
+
+    # ── Fetch historical data ─────────────────────────────────────────────────
+    # Need at least 6 months before entry (for RSI warm-up) and up to 3 weeks
+    # (15 trading days ≈ 22 calendar days) after entry for forward returns.
+    hist_start = entry_date - timedelta(days=200)   # ~6.5 months
+    hist_end = entry_date + timedelta(days=35)    # 3 weeks buffer
+
+    df = fetch_data(symbol, hist_start, hist_end)
+
+    if df is None or df.empty:
+        log.warning(f"[{symbol}] No price data — skipping.")
+        return base
+
+    # Ensure 'Close' column exists (handle yfinance column naming quirks)
+    if "Close" not in df.columns:
+        close_candidates = [c for c in df.columns if c.lower() == "close"]
+        if not close_candidates:
+            log.warning(
+                f"[{symbol}] No 'Close' column found in data — skipping.")
+            return base
+        df = df.rename(columns={close_candidates[0]: "Close"})
+
+    # ── Find nearest trading day on/before entry date ─────────────────────────
+    entry_idx = get_nearest_trading_day_idx(df, entry_date)
+    if entry_idx is None:
+        log.warning(
+            f"[{symbol}] No trading day on or before {entry_date.date()} — skipping.")
+        return base
+
+    actual_entry_date = df.index[entry_idx].date()
+    if actual_entry_date != entry_date.date():
+        log.info(
+            f"[{symbol}] Entry {entry_date.date()} → nearest trading day {actual_entry_date}")
+
+    # ── RSI ───────────────────────────────────────────────────────────────────
+    closes = df["Close"].astype(float)
+    rsi_series = calculate_rsi(closes, period=14)
+    rsi_raw = rsi_series.iloc[entry_idx]
+    rsi_val = float(rsi_raw) if not np.isnan(rsi_raw) else None
+
+    # ── Forward returns ───────────────────────────────────────────────────────
+    returns = compute_returns(df, entry_idx, windows=(5, 10, 15))
+
+    # ── Delivery % ───────────────────────────────────────────────────────────
+    delivery = fetch_delivery(symbol)
+
+    # ── Assemble result ───────────────────────────────────────────────────────
+    result = {
+        **base,
+        "Entry Price":  returns["entry_price"],
+        "RSI":          round(rsi_val, 2) if rsi_val is not None else None,
+        "1W Return %":  returns.get("ret_5d"),
+        "2W Return %":  returns.get("ret_10d"),
+        "3W Return %":  returns.get("ret_15d"),
+        "Delivery %":   delivery,
+    }
+    result["Signal"] = classify_signal(result["RSI"])
+    result["Win/Loss"] = classify_win_loss(result["1W Return %"])
+
+    log.info(
+        f"[{symbol}]  Date={actual_entry_date}  Price=₹{result['Entry Price']}  "
+        f"RSI={result['RSI']}  1W={result['1W Return %']}%  "
+        f"Signal={result['Signal']}  {result['Win/Loss']}"
+    )
+    return result
+'''
+
+# ONLY showing modified + required parts (rest remains same)
+
 
 def process_stock(row: pd.Series) -> dict:
     symbol = str(row["Symbol"]).strip().upper()
@@ -367,24 +479,30 @@ def process_stock(row: pd.Series) -> dict:
     entry_date = pd.to_datetime(row["Date of Entry"])
 
     base = {
-        "Symbol":              symbol,
-        "Sector":              sector,
-        "Market Cap":          mkt_cap,
+        "Symbol": symbol,
+        "Sector": sector,
+        "Market Cap": mkt_cap,
+
+        # ✅ FIXED DATE HANDLING
         "Original Entry Date": entry_date.date(),
-        "Entry Date":          None,
-        "Date Shift (Days)":   None,
-        "Entry Price":         None,
-        "RSI":                 None,
-        "1W Return %":         None,
-        "2W Return %":         None,
-        "3W Return %":         None,
-        "Delivery %":          None,
-        "Signal":              "N/A",
-        "Win/Loss":            "N/A",
+        "Entry Date": None,
+        "Date Shift (Days)": None,
+
+        "Entry Price": None,
+        "RSI": None,
+        "2D Return %": None,
+        "3D Return %": None,
+        "4D Return %": None,
+        "5D Return %": None,
+        "6D Return %": None,
+        "10D Return %": None,
+        "Delivery %": None,
+        "Signal": "N/A",
+        "Win/Loss": "N/A",
     }
 
     hist_start = entry_date - timedelta(days=200)
-    hist_end = entry_date + timedelta(days=35)
+    hist_end = entry_date + timedelta(days=20)    # 10 trading days ≈ 14 calendar days
 
     df = fetch_data(symbol, hist_start, hist_end)
     if df is None or df.empty:
@@ -408,111 +526,67 @@ def process_stock(row: pd.Series) -> dict:
     rsi_raw = rsi_series.iloc[entry_idx]
     rsi_val = float(rsi_raw) if not np.isnan(rsi_raw) else None
 
-    returns = compute_returns(df, entry_idx, windows=(5, 10, 15))
+    returns = compute_returns(df, entry_idx, windows=(2, 3, 4, 5, 6, 10))
     delivery = fetch_delivery(symbol)
 
     result = {
         **base,
-        "Entry Date":        actual_entry_date,
+        "Entry Date": actual_entry_date,
         "Date Shift (Days)": shift_days,
-        "Entry Price":       returns["entry_price"],
-        "RSI":               round(rsi_val, 2) if rsi_val is not None else None,
-        "1W Return %":       returns.get("ret_5d"),
-        "2W Return %":       returns.get("ret_10d"),
-        "3W Return %":       returns.get("ret_15d"),
-        "Delivery %":        delivery,
+        "Entry Price": returns["entry_price"],
+        "RSI": round(rsi_val, 2) if rsi_val is not None else None,
+        "2D Return %": returns.get("ret_2d"),
+        "3D Return %": returns.get("ret_3d"),
+        "4D Return %": returns.get("ret_4d"),
+        "5D Return %": returns.get("ret_5d"),
+        "6D Return %": returns.get("ret_6d"),
+        "10D Return %": returns.get("ret_10d"),
+        "Delivery %": delivery,
     }
-    result["Signal"] = classify_signal(result["RSI"])
-    result["Win/Loss"] = classify_win_loss(result["1W Return %"])
 
-    log.info(
-        f"[{symbol}]  Date={actual_entry_date}  Price=₹{result['Entry Price']}  "
-        f"RSI={result['RSI']}  1W={result['1W Return %']}%  "
-        f"Signal={result['Signal']}  {result['Win/Loss']}"
-    )
+    result["Signal"] = classify_signal(result["RSI"])
+    result["Win/Loss"] = classify_win_loss(result["5D Return %"])
+
     return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  8. ORCHESTRATION  — parallel with batch pre-fetch
+#  8. ORCHESTRATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run_backtest(input_file: str,
-                 output_file: str = "final_output.xlsx",
-                 progress_callback=None) -> pd.DataFrame:
+def run_backtest(input_file: str, output_file: str = "final_output.xlsx") -> pd.DataFrame:
     """
     Main pipeline:
-      1. Load screener file
-      2. Batch pre-fetch ALL price data (one yf.download call per chunk)
-      3. Process stocks in parallel (ThreadPoolExecutor)
-      4. Save professional Excel report
-
-    Parameters
-    ----------
-    progress_callback : callable(current, total) | None
-        If provided, called after each stock completes — use for Streamlit
-        progress bars:  progress_callback(i, total)
+      1. Load input screener file
+      2. Process each stock (fetch price, RSI, returns, delivery)
+      3. Save professional Excel report
     """
     df_input = load_input_file(input_file)
+    rows = []
     total = len(df_input)
 
-    # ── Step 1: determine global date range for batch download ────────────────
-    min_date = df_input["Date of Entry"].min() - timedelta(days=200)
-    max_date = df_input["Date of Entry"].max() + timedelta(days=35)
-
-    symbols = df_input["Symbol"].unique().tolist()
-
-    # ── Step 2: batch download in chunks ──────────────────────────────────────
-    for i in range(0, len(symbols), BATCH_CHUNK_SIZE):
-        chunk = symbols[i: i + BATCH_CHUNK_SIZE]
-        _batch_prefetch(chunk, min_date, max_date, exchange="NS")
-        # Fallback .BO batch for symbols that got no .NS data
-        ns_miss = [
-            s for s in chunk
-            if not any(
-                f"{s}.NS" in k and _DATA_CACHE.get(k) is not None
-                for k in _DATA_CACHE
-            )
-        ]
-        if ns_miss:
-            _batch_prefetch(ns_miss, min_date, max_date, exchange="BO")
-
-    # ── Step 3: parallel processing ───────────────────────────────────────────
-    rows = [None] * total
-    futures_map = {}
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for idx, (_, row) in enumerate(df_input.iterrows()):
-            future = executor.submit(process_stock, row)
-            futures_map[future] = idx
-
-        completed = 0
-        for future in as_completed(futures_map):
-            idx = futures_map[future]
-            try:
-                rows[idx] = future.result()
-            except Exception as e:
-                row = df_input.iloc[idx]
-                log.error(f"[{row['Symbol']}] Unhandled error: {e}")
-                rows[idx] = {
-                    "Symbol":              row["Symbol"],
-                    "Sector":              row.get("Sector",     "N/A"),
-                    "Market Cap":          row.get("Market Cap", "N/A"),
-                    "Original Entry Date": row["Date of Entry"].date(),
-                    "Entry Date":          None,
-                    "Date Shift (Days)":   None,
-                    "Entry Price":         None,
-                    "RSI":                 None,
-                    "1W Return %":         None,
-                    "2W Return %":         None,
-                    "3W Return %":         None,
-                    "Delivery %":          None,
-                    "Signal":              "N/A",
-                    "Win/Loss":            "N/A",
-                }
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total)
+    for i, (_, row) in enumerate(df_input.iterrows(), 1):
+        log.info(
+            f"─── [{i}/{total}] {row['Symbol']}  ({row['Date of Entry'].date()}) ───")
+        try:
+            result = process_stock(row)
+        except Exception as e:
+            log.error(f"[{row['Symbol']}] Unexpected error: {e}",
+                      exc_info=True)
+            result = {
+                "Symbol":      row["Symbol"],
+                "Sector":      row.get("Sector",     "N/A"),
+                "Market Cap":  row.get("Market Cap", "N/A"),
+                "Original Entry Date": row["Date of Entry"].date(),
+                "Entry Date":  None,
+                "Date Shift (Days)": None,
+                "Entry Price": None, "RSI":         None,
+                "2D Return %": None, "3D Return %": None, "4D Return %": None,
+                "5D Return %": None, "6D Return %": None, "10D Return %": None,
+                "Delivery %":  None, "Signal":      "N/A", "Win/Loss":    "N/A",
+            }
+        rows.append(result)
+        time.sleep(0.25)   # polite rate-limiting
 
     df_out = pd.DataFrame(rows)
     save_excel(df_out, output_file)
@@ -521,9 +595,10 @@ def run_backtest(input_file: str,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  9. EXCEL OUTPUT
+#  9. EXCEL OUTPUT — professional formatting
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Colour palette
 C_HEADER_BG = "1F3864"
 C_HEADER_FG = "FFFFFF"
 C_ALT_ROW = "EEF2F7"
@@ -560,22 +635,26 @@ def _build_main_sheet(wb: Workbook, df: pd.DataFrame):
     ws.freeze_panes = "A2"
 
     columns = [
-        ("Symbol",              14),
-        ("Sector",              22),
-        ("Market Cap",          14),
+        ("Symbol", 14),
+        ("Sector", 22),
+        ("Market Cap", 14),
         ("Original Entry Date", 18),
-        ("Entry Date",          14),
-        ("Date Shift (Days)",   16),
-        ("Entry Price",         14),
-        ("RSI",                 10),
-        ("1W Return %",         13),
-        ("2W Return %",         13),
-        ("3W Return %",         13),
-        ("Delivery %",          13),
-        ("Signal",              13),
-        ("Win/Loss",            11),
+        ("Entry Date", 14),
+        ("Date Shift (Days)", 16),
+        ("Entry Price", 14),
+        ("RSI", 10),
+        ("2D Return %", 13),
+        ("3D Return %", 13),
+        ("4D Return %", 13),
+        ("5D Return %", 13),
+        ("6D Return %", 13),
+        ("10D Return %", 13),
+        ("Delivery %", 13),
+        ("Signal", 13),
+        ("Win/Loss", 11),
     ]
 
+    # Header row
     for ci, (hdr, width) in enumerate(columns, 1):
         c = ws.cell(row=1, column=ci, value=hdr)
         c.font = Font(name="Arial", bold=True, color=C_HEADER_FG, size=11)
@@ -589,9 +668,11 @@ def _build_main_sheet(wb: Workbook, df: pd.DataFrame):
 
     for ri, (_, row) in enumerate(df[col_names].iterrows(), 2):
         is_alt = (ri % 2 == 0)
+
         for ci, col in enumerate(col_names, 1):
             val = row[col]
-            if not isinstance(val, str) and pd.isna(val):
+            # Convert NaN / pandas NA to None for openpyxl
+            if pd.isna(val) if not isinstance(val, str) else False:
                 val = None
             c = ws.cell(row=ri, column=ci, value=val)
             c.font = Font(name="Arial", size=10)
@@ -600,17 +681,21 @@ def _build_main_sheet(wb: Workbook, df: pd.DataFrame):
             if is_alt:
                 c.fill = _fill(C_ALT_ROW)
 
-        ws.cell(row=ri, column=4).number_format = "YYYY-MM-DD"
+        # Entry Date format (col 5)
+        ws.cell(row=ri, column=5).number_format = "YYYY-MM-DD"
 
-        ep = ws.cell(row=ri, column=5)
+        # Entry Price format (col 7)
+        ep = ws.cell(row=ri, column=7)
         if isinstance(ep.value, (int, float)):
-            ep.number_format = "₹#,##0.00"
+            ep.number_format = '₹#,##0.00'
 
-        rsi_c = ws.cell(row=ri, column=6)
+        # RSI format (col 8)
+        rsi_c = ws.cell(row=ri, column=8)
         if isinstance(rsi_c.value, (int, float)):
             rsi_c.number_format = "0.00"
 
-        for ret_col in (9, 10, 11):
+        # Return % coloring & format (cols 9-14: 2D,3D,4D,5D,6D,10D)
+        for ret_col in (9, 10, 11, 12, 13, 14):
             rc = ws.cell(row=ri, column=ret_col)
             rv = rc.value
             if isinstance(rv, (int, float)):
@@ -622,11 +707,13 @@ def _build_main_sheet(wb: Workbook, df: pd.DataFrame):
                     rc.font = Font(name="Arial", size=10,
                                    bold=True, color=C_NEG_RET)
 
-        dv = ws.cell(row=ri, column=12)
+        # Delivery % format (col 15)
+        dv = ws.cell(row=ri, column=15)
         if isinstance(dv.value, (int, float)):
             dv.number_format = "0.00"
 
-        sc = ws.cell(row=ri, column=13)
+        # Signal coloring (col 16)
+        sc = ws.cell(row=ri, column=16)
         sig = row["Signal"]
         if sig == "Momentum":
             sc.fill = _fill(C_MOMENTUM)
@@ -638,7 +725,8 @@ def _build_main_sheet(wb: Workbook, df: pd.DataFrame):
             sc.fill = _fill(C_NEUTRAL)
             sc.font = Font(name="Arial", size=10, bold=True, color="7D6608")
 
-        wlc = ws.cell(row=ri, column=14)
+        # Win/Loss coloring (col 17)
+        wlc = ws.cell(row=ri, column=17)
         if row["Win/Loss"] == "Win":
             wlc.fill = _fill(C_WIN)
             wlc.font = Font(name="Arial", size=10, bold=True, color=C_POS_RET)
@@ -653,13 +741,13 @@ def _build_summary_sheet(wb: Workbook, df: pd.DataFrame):
     ws = wb.create_sheet("Summary")
     valid = df[df["Entry Price"].notna()]
     total = len(df)
-
     win_df = valid[valid["Win/Loss"] == "Win"]
     loss_df = valid[valid["Win/Loss"] == "Loss"]
     win_rate = (len(win_df) / len(valid) * 100) if len(valid) else 0
-    avg_1w = valid["1W Return %"].mean()
-    avg_2w = valid["2W Return %"].mean()
-    avg_3w = valid["3W Return %"].mean()
+    avg_2d  = valid["2D Return %"].mean()
+    avg_5d  = valid["5D Return %"].mean()
+    avg_10d = valid["10D Return %"].mean()
+
     sig_counts = valid["Signal"].value_counts().to_dict()
 
     def section(row, title):
@@ -708,26 +796,26 @@ def _build_summary_sheet(wb: Workbook, df: pd.DataFrame):
 
     section(r, "  PERFORMANCE METRICS")
     r += 1
-    metric(r,  "Win Rate (1W)",           win_rate / 100,      "pct")
+    metric(r,  "Win Rate (5D)",           win_rate / 100,         "pct")
     r += 1
     metric(r,  "Total Wins",              len(win_df))
     r += 1
     metric(r,  "Total Losses",            len(loss_df))
     r += 1
-    metric(r,  "Avg 1-Week Return",       (avg_1w or 0) / 100, "ret")
+    metric(r,  "Avg 2-Day Return",        (avg_2d  or 0) / 100,   "ret")
     r += 1
-    metric(r,  "Avg 2-Week Return",       (avg_2w or 0) / 100, "ret")
+    metric(r,  "Avg 5-Day Return",        (avg_5d  or 0) / 100,   "ret")
     r += 1
-    metric(r,  "Avg 3-Week Return",       (avg_3w or 0) / 100, "ret")
+    metric(r,  "Avg 10-Day Return",       (avg_10d or 0) / 100,   "ret")
     r += 2
 
     section(r, "  SIGNAL BREAKDOWN")
     r += 1
-    metric(r,  "Momentum Stocks", sig_counts.get("Momentum", 0))
+    metric(r,  "Momentum Stocks",         sig_counts.get("Momentum", 0))
     r += 1
-    metric(r,  "Neutral Stocks",  sig_counts.get("Neutral",  0))
+    metric(r,  "Neutral Stocks",          sig_counts.get("Neutral",  0))
     r += 1
-    metric(r,  "Weak Stocks",     sig_counts.get("Weak",     0))
+    metric(r,  "Weak Stocks",             sig_counts.get("Weak",     0))
     r += 2
 
     section(r, "  SECTOR DISTRIBUTION")
@@ -737,8 +825,7 @@ def _build_summary_sheet(wb: Workbook, df: pd.DataFrame):
         metric(r, f"  {sector_name}", cnt)
         r += 1
 
-    for col, width in [("A", 2), ("B", 28), ("C", 5),
-                       ("D", 18), ("E", 5), ("F", 5)]:
+    for col, width in [("A", 2), ("B", 28), ("C", 5), ("D", 18), ("E", 5), ("F", 5)]:
         ws.column_dimensions[col].width = width
 
 
@@ -758,37 +845,16 @@ def print_summary(df: pd.DataFrame):
     print(f"  Total stocks           : {total}")
     print(f"  Successfully analysed  : {len(valid)}")
     print(f"  Skipped / errors       : {total - len(valid)}")
-    print(f"  Win rate (1W)          : {win_rate:.1f}%")
+    print(f"  Win rate (5D)          : {win_rate:.1f}%")
     if len(valid):
-        print(f"  Avg 1W Return          : {valid['1W Return %'].mean():.2f}%")
-        print(f"  Avg 2W Return          : {valid['2W Return %'].mean():.2f}%")
-        print(f"  Avg 3W Return          : {valid['3W Return %'].mean():.2f}%")
+        print(f"  Avg 2D Return          : {valid['2D Return %'].mean():.2f}%")
+        print(f"  Avg 5D Return          : {valid['5D Return %'].mean():.2f}%")
+        print(f"  Avg 10D Return         : {valid['10D Return %'].mean():.2f}%")
         sig_counts = valid["Signal"].value_counts()
         print(f"\n  Signal breakdown:")
         for sig, cnt in sig_counts.items():
             print(f"    {sig:12s} : {cnt}")
     print("═" * 58 + "\n")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STREAMLIT HELPER  — drop this into your app.py
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  import streamlit as st
-#  from backtest import run_backtest
-#
-#  uploaded = st.file_uploader("Upload screener file", type=["xlsx","csv"])
-#  if uploaded and st.button("Run Backtest"):
-#      with st.spinner("Running backtest …"):
-#          progress_bar = st.progress(0)
-#          def on_progress(done, total):
-#              progress_bar.progress(done / total)
-#          df = run_backtest(uploaded.name, "final_output.xlsx",
-#                            progress_callback=on_progress)
-#      st.success("Done!")
-#      st.dataframe(df)
-#      with open("final_output.xlsx", "rb") as f:
-#          st.download_button("Download Excel", f, "backtest_results.xlsx")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -808,4 +874,5 @@ if __name__ == "__main__":
 
     log.info(f"Input  : {input_path}")
     log.info(f"Output : {output_path}")
-    run_backtest(input_path, output_path)
+
+    results = run_backtest(input_path, output_path)
