@@ -15,25 +15,6 @@ import streamlit as st
 import pandas as pd
 from backtest import run_backtest, classify_signal, classify_win_loss
 
-st.set_page_config(
-    page_title="NSE Stock Backtester",
-    page_icon="📊",
-    layout="wide",
-)
-
-uploaded = st.file_uploader("Upload screener file", type=["xlsx", "csv"])
-if uploaded and st.button("Run Backtest"):
-    with st.spinner("Running backtest …"):
-        progress_bar = st.progress(0)
-
-        def on_progress(done, total):
-            progress_bar.progress(done / total)
-        df = run_backtest(uploaded.name, "final_output.xlsx",
-                          progress_callback=on_progress)
-    st.success("Done!")
-    st.dataframe(df)
-    with open("final_output.xlsx", "rb") as f:
-        st.download_button("Download Excel", f, "backtest_results.xlsx")
 
 #  import streamlit as st
 #  from backtest import run_backtest
@@ -160,8 +141,8 @@ if uploaded_file is not None:
             valid = df_result[df_result["Entry Price"].notna()]
             wins = (valid["Win/Loss"] == "Win").sum()
             win_rate = wins / len(valid) * 100 if len(valid) else 0
-            avg_2d  = valid["2D Return %"].mean()
-            avg_5d  = valid["5D Return %"].mean()
+            avg_2d = valid["2D Return %"].mean()
+            avg_5d = valid["5D Return %"].mean()
             avg_10d = valid["10D Return %"].mean()
 
             m1, m2, m3, m4, m5 = st.columns(5)
